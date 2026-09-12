@@ -30,7 +30,6 @@ const els = {
 };
 
 const audio = {
-  beep: new Audio("audio/sfx/beep.wav"),
   correctSfx: new Audio("audio/sfx/correct.wav"),
   wrongSfx: new Audio("audio/sfx/wrong.wav"),
   correct: new Audio("audio/phrases/correct.wav"),
@@ -42,26 +41,18 @@ const audio = {
 for (const a of Object.values(audio)) {
   a.preload = "auto";
 }
-audio.beep.volume = 0.45;
+
+const LANGS = ["zh-HK", "zh-TW", "zh-CN"];
 
 let state = {
   level: 1,
   theme: null,
   index: 0,
-  tries: 0,
   token: 0,
   listening: false,
   recognizer: null,
-  parentMode: false,
-  awaitingHint: false,
-};
-
-const mic = {
-  stream: null,
-  ctx: null,
-  analyser: null,
-  peak: 0,
-  raf: 0,
+  ignoreUntil: 0,
+  micReady: false,
 };
 
 function showScreen(name) {
@@ -155,101 +146,41 @@ function isMatch(heard, word) {
   return false;
 }
 
-function anyMatch(heard, word) {
-  const texts = [heard.text, ...(heard.alts || [])].filter(Boolean);
-  return texts.some((t) => isMatch(t, word));
-}
-
 function SpeechCtor() {
   return window.SpeechRecognition || window.webkitSpeechRecognition || null;
 }
 
-function setMeter(on, rms = 0) {
+function setMeter(on) {
   if (!els.voiceMeter) return;
   els.voiceMeter.classList.toggle("on", on);
-  if (!on) {
-    els.voiceMeter.dataset.level = "0";
-    return;
-  }
-  const level = rms < 0.012 ? 1 : rms < 0.03 ? 2 : rms < 0.06 ? 3 : rms < 0.11 ? 4 : 5;
-  els.voiceMeter.dataset.level = String(level);
-}
-
-function tickMeter() {
-  if (!mic.analyser) return;
-  const data = new Uint8Array(mic.analyser.fftSize);
-  const loop = () => {
-    mic.raf = requestAnimationFrame(loop);
-    if (!mic.analyser) return;
-    mic.analyser.getByteTimeDomainData(data);
-    let sum = 0;
-    for (let i = 0; i < data.length; i++) {
-      const v = (data[i] - 128) / 128;
-      sum += v * v;
-    }
-    const rms = Math.sqrt(sum / data.length);
-    mic.peak = Math.max(mic.peak * 0.9, rms);
-    if (state.listening) setMeter(true, rms);
-  };
-  loop();
+  els.voiceMeter.dataset.level = on ? "3" : "0";
 }
 
 async function ensureMic() {
-  if (mic.stream && mic.stream.active) {
-    try { await mic.ctx.resume(); } catch { /* ignore */ }
-    return true;
-  }
+  if (state.micReady) return true;
   if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) return false;
   try {
+    const stream = await navigator.mediaDevices.getUserMedia({
+      audio: {
+        echoCancellation: true,
+        noiseSuppression: false,
+        autoGainControl: true,
+        channelCount: 1,
+      },
+    });
+    stream.getTracks().forEach((t) => t.stop());
+    state.micReady = true;
+    return true;
+  } catch {
     try {
-      mic.stream = await navigator.mediaDevices.getUserMedia({
-        audio: {
-          echoCancellation: true,
-          noiseSuppression: false,
-          autoGainControl: true,
-          channelCount: 1,
-        },
-      });
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      stream.getTracks().forEach((t) => t.stop());
+      state.micReady = true;
+      return true;
     } catch {
-      mic.stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      return false;
     }
-  } catch {
-    return false;
   }
-  try {
-    const Ctx = window.AudioContext || window.webkitAudioContext;
-    mic.ctx = new Ctx();
-    await mic.ctx.resume();
-    const src = mic.ctx.createMediaStreamSource(mic.stream);
-    const gain = mic.ctx.createGain();
-    gain.gain.value = 5;
-    mic.analyser = mic.ctx.createAnalyser();
-    mic.analyser.fftSize = 1024;
-    mic.analyser.smoothingTimeConstant = 0.25;
-    src.connect(gain);
-    gain.connect(mic.analyser);
-    tickMeter();
-  } catch {
-    /* analyser is optional; SpeechRecognition can still run */
-  }
-  return true;
-}
-
-function releaseMic() {
-  stopListening();
-  if (mic.raf) cancelAnimationFrame(mic.raf);
-  mic.raf = 0;
-  if (mic.stream) {
-    mic.stream.getTracks().forEach((t) => t.stop());
-    mic.stream = null;
-  }
-  if (mic.ctx) {
-    try { mic.ctx.close(); } catch { /* ignore */ }
-    mic.ctx = null;
-  }
-  mic.analyser = null;
-  mic.peak = 0;
-  setMeter(false);
 }
 
 function stopListening() {
@@ -274,86 +205,89 @@ function collectTranscripts(ev) {
   return texts;
 }
 
-function listenForWord(token, word, opts) {
-  const duration = opts.duration || 9000;
-  const ignoreUntil = opts.ignoreUntil || 0;
+function bindGrammar(rec, word) {
+  try {
+    const G = window.SpeechGrammarList || window.webkitSpeechGrammarList;
+    if (!G) return;
+    const terms = [word.text, ...(word.aliases || [])]
+      .filter((t) => /[\u4e00-\u9fff]/.test(t))
+      .slice(0, 8);
+    if (!terms.length) return;
+    const list = new G();
+    list.addFromString(`#JSGF V1.0; grammar w; public <w> = ${terms.join(" | ")} ;`, 1);
+    rec.grammars = list;
+  } catch {
+    /* grammar is optional */
+  }
+}
+
+function listenUntilMatch(token, word) {
   return new Promise((resolve) => {
     const Ctor = SpeechCtor();
     if (!Ctor) {
-      resolve({ text: "", reason: "unsupported", alts: [] });
+      resolve({ text: "", reason: "unsupported" });
       return;
     }
 
-    const deadline = Date.now() + duration;
-    const alts = [];
     let rec = null;
     let settled = false;
-    let armed = Date.now() >= ignoreUntil;
     let restarting = false;
+    let langIndex = 0;
 
     const finish = (value) => {
-      if (settled || token !== state.token) return;
+      if (settled) return;
       settled = true;
       state.listening = false;
       els.micDot.classList.remove("on");
+      setMeter(false);
       try { if (rec) rec.stop(); } catch { /* ignore */ }
       resolve(value);
     };
 
-    const pack = (reason) => {
-      const heardSound = armed && mic.peak > 0.018;
-      return {
-        text: alts[0] || "",
-        alts: alts.slice(),
-        reason: alts.length ? "ok" : reason,
-        heardSound,
-      };
-    };
-
     const startRec = () => {
-      if (settled || token !== state.token || restarting) return;
-      if (Date.now() >= deadline) {
-        finish(pack("timeout"));
+      if (settled || restarting) return;
+      if (token !== state.token) {
+        finish({ text: "", reason: "cancelled" });
         return;
       }
       rec = new Ctor();
       state.recognizer = rec;
-      rec.lang = "zh-HK";
+      rec.lang = LANGS[langIndex % LANGS.length];
+      langIndex += 1;
       rec.interimResults = true;
       rec.maxAlternatives = 8;
       rec.continuous = true;
+      bindGrammar(rec, word);
 
       rec.onresult = (ev) => {
         if (settled || token !== state.token) return;
-        if (Date.now() < ignoreUntil) return;
-        armed = true;
+        if (Date.now() < state.ignoreUntil) return;
         const texts = collectTranscripts(ev);
         for (const t of texts) {
-          if (!alts.includes(t)) alts.push(t);
           if (isMatch(t, word)) {
-            finish({ text: t, alts: alts.slice(), reason: "ok", heardSound: true });
+            finish({ text: t, reason: "ok" });
             return;
           }
         }
       };
       rec.onerror = (ev) => {
         const err = ev.error || "error";
-        if (err === "no-speech" || err === "aborted" || err === "audio-capture") return;
+        if (err === "no-speech" || err === "aborted" || err === "audio-capture" || err === "network") return;
         if (err === "not-allowed" || err === "service-not-allowed") {
-          finish({ text: "", reason: err, alts: [] });
+          finish({ text: "", reason: err });
         }
       };
       rec.onend = () => {
-        if (settled || token !== state.token) return;
-        if (Date.now() < deadline) {
-          restarting = true;
-          setTimeout(() => {
-            restarting = false;
-            startRec();
-          }, 60);
+        if (settled) return;
+        if (token !== state.token) {
+          finish({ text: "", reason: "cancelled" });
           return;
         }
-        finish(pack("end"));
+        restarting = true;
+        setTimeout(() => {
+          restarting = false;
+          startRec();
+        }, 80);
       };
 
       try {
@@ -363,127 +297,27 @@ function listenForWord(token, word, opts) {
         setTimeout(() => {
           restarting = false;
           startRec();
-        }, 180);
+        }, 200);
       }
     };
 
     state.listening = true;
     els.micDot.classList.add("on");
-    setMeter(true, 0);
-    if (ignoreUntil > Date.now()) {
-      setTimeout(() => {
-        if (!settled) {
-          mic.peak = 0;
-          armed = true;
-        }
-      }, Math.max(0, ignoreUntil - Date.now()));
-    }
+    setMeter(true);
     startRec();
-    setTimeout(() => {
-      if (settled) return;
-      try { if (rec) rec.stop(); } catch { /* ignore */ }
-      finish(pack("timeout"));
-    }, duration + 500);
   });
-}
-
-async function listenServer(token) {
-  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
-    return { text: "", reason: "no-media" };
-  }
-  let stream = mic.stream && mic.stream.active ? mic.stream : null;
-  let owned = false;
-  if (!stream) {
-    try {
-      stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      owned = true;
-    } catch {
-      return { text: "", reason: "mic-denied" };
-    }
-  }
-
-  const mime = MediaRecorder.isTypeSupported("audio/webm;codecs=opus")
-    ? "audio/webm;codecs=opus"
-    : MediaRecorder.isTypeSupported("audio/mp4")
-      ? "audio/mp4"
-      : "";
-  const rec = mime ? new MediaRecorder(stream, { mimeType: mime }) : new MediaRecorder(stream);
-  const chunks = [];
-  rec.ondataavailable = (e) => {
-    if (e.data && e.data.size) chunks.push(e.data);
-  };
-
-  state.listening = true;
-  els.micDot.classList.add("on");
-  rec.start();
-  await wait(2800);
-  if (token !== state.token) {
-    rec.stop();
-    if (owned) stream.getTracks().forEach((t) => t.stop());
-    return { text: "", reason: "cancelled" };
-  }
-  await new Promise((resolve) => {
-    rec.onstop = resolve;
-    try { rec.stop(); } catch { resolve(); }
-  });
-  if (owned) stream.getTracks().forEach((t) => t.stop());
-  state.listening = false;
-  els.micDot.classList.remove("on");
-
-  const blob = new Blob(chunks, { type: rec.mimeType || "audio/webm" });
-  try {
-    const res = await fetch("/api/hear", { method: "POST", body: blob });
-    if (!res.ok) return { text: "", reason: "server" };
-    const data = await res.json();
-    return { text: data.text || "", reason: data.text ? "ok" : "empty" };
-  } catch {
-    return { text: "", reason: "server" };
-  }
 }
 
 function needsParent(heard) {
-  return ["unsupported", "no-media", "mic-denied", "not-allowed", "service-not-allowed", "server"].includes(
+  return ["unsupported", "no-media", "mic-denied", "not-allowed", "service-not-allowed"].includes(
     heard.reason
   );
-}
-
-async function hearChild(token, word) {
-  const web = SpeechCtor();
-  if (web) {
-    const first = await listenForWord(token, word, {
-      duration: 10000,
-      ignoreUntil: Date.now() + 1400,
-    });
-    if (token !== state.token) return { text: "", reason: "cancelled" };
-    if (first.text) return first;
-    const fallback = ["not-allowed", "service-not-allowed", "network"];
-    if (fallback.includes(first.reason)) {
-      const second = await listenServer(token);
-      if (token !== state.token) return { text: "", reason: "cancelled" };
-      if (second.text) return second;
-      return { text: "", reason: "unsupported" };
-    }
-    if (!first.text && first.heardSound && mic.stream) {
-      mic.stream.getAudioTracks().forEach((t) => { t.enabled = false; });
-      const solo = await listenForWord(token, word, { duration: 6000, ignoreUntil: 0 });
-      mic.stream.getAudioTracks().forEach((t) => { t.enabled = true; });
-      if (token !== state.token) return { text: "", reason: "cancelled" };
-      if (solo.text) return solo;
-    }
-    return first;
-  }
-  const second = await listenServer(token);
-  if (token !== state.token) return { text: "", reason: "cancelled" };
-  if (second.text) return second;
-  if (second.reason === "mic-denied" || second.reason === "no-media") return second;
-  return { text: "", reason: "unsupported" };
 }
 
 function setStatus(text, listening = false) {
   els.status.textContent = text;
   els.micDot.classList.toggle("on", listening);
-  if (listening) setMeter(true, mic.peak);
-  else setMeter(false);
+  setMeter(listening);
 }
 
 function renderProgress() {
@@ -519,6 +353,16 @@ function setLevelChrome() {
   showHint(state.level === 2);
 }
 
+function muteMatching(ms) {
+  state.ignoreUntil = Date.now() + ms;
+}
+
+async function playPrompt() {
+  muteMatching(8000);
+  await playAudio(audio.word);
+  muteMatching(250);
+}
+
 async function unlockAudioAndMic() {
   try {
     const Ctx = window.AudioContext || window.webkitAudioContext;
@@ -534,7 +378,7 @@ async function unlockAudioAndMic() {
   } catch {
     /* ignore */
   }
-  for (const a of [audio.beep, audio.correctSfx, audio.wrongSfx, audio.correct, audio.tryagain, audio.bravo]) {
+  for (const a of [audio.correctSfx, audio.wrongSfx, audio.correct, audio.tryagain, audio.bravo]) {
     try {
       a.muted = true;
       await a.play();
@@ -569,7 +413,6 @@ function chooseLevel(level) {
 function startTheme(theme) {
   state.theme = theme;
   state.index = 0;
-  state.tries = 0;
   els.playTitle.textContent = "Level " + state.level + " · " + theme.title;
   setLevelChrome();
   showScreen("play");
@@ -581,9 +424,7 @@ async function runCard() {
   hideOverlay();
   showParentHelp(false);
   stopListening();
-  state.awaitingHint = false;
   const word = currentWord();
-  state.tries = 0;
   els.picture.src = `images/words/${word.id}.jpg`;
   els.picture.alt = word.text;
   els.word.textContent = word.text;
@@ -597,98 +438,49 @@ async function playRound(token) {
   const word = currentWord();
   if (token !== state.token) return;
 
-  if (state.level === 1) {
-    showHint(false);
-    setStatus("聽一聽");
-    await wait(400);
-    if (token !== state.token) return;
-    await playAudio(audio.word);
-    if (token !== state.token) return;
-    await wait(280);
-    if (token !== state.token) return;
-  } else {
-    showHint(true);
-    setStatus("請讀出來");
-    await wait(600);
-    if (token !== state.token) return;
-    if (state.awaitingHint) {
-      state.awaitingHint = false;
-      setStatus("聽提示");
-      await playAudio(audio.word);
-      if (token !== state.token) return;
-      await wait(200);
-    }
-  }
-
   await ensureMic();
   if (token !== state.token) return;
 
-  while (token === state.token) {
-    mic.peak = 0;
-    setStatus(state.level === 1 ? "請讀：" + word.text : "請讀出來", true);
-    const heardPromise = hearChild(token, word);
-    await wait(1000);
-    if (token !== state.token) return;
-    playAudio(audio.beep);
-    const heard = await heardPromise;
-    if (token !== state.token) return;
-
-    if (state.awaitingHint) {
-      state.awaitingHint = false;
-      setStatus("聽提示");
-      await playAudio(audio.word);
-      if (token !== state.token) return;
-      await wait(200);
-      continue;
-    }
-
-    if (needsParent(heard)) {
-      setStatus("家長幫手聽一聽");
-      showParentHelp(true);
-      return;
-    }
-
-    if (anyMatch(heard, word)) {
-      await celebrate(token);
-      return;
-    }
-
-    if (!heard.text) {
-      state.tries += 1;
-      stopListening();
-      if (state.tries >= 3) {
-        setStatus("家長幫手聽一聽");
-        showParentHelp(true);
-        return;
-      }
-      setStatus(heard.heardSound ? "大聲啲讀俾我聽" : "聽唔到，再讀一次", true);
-      await wait(700);
-      if (token !== state.token) return;
-      continue;
-    }
-
-    state.tries += 1;
-    stopListening();
-    if (state.tries === 1) {
-      setStatus("再讀一次，大聲啲", true);
-      await wait(650);
-      if (token !== state.token) return;
-      continue;
-    }
-    showOverlay("bad", "再試一次", "images/ui/retry.jpg");
-    playAudio(audio.wrongSfx);
-    await wait(120);
-    await playAudio(audio.tryagain);
-    if (token !== state.token) return;
-    await wait(450);
-    hideOverlay();
-    if (token !== state.token) return;
-    if (state.level === 1 && state.tries % 3 === 0) {
-      setStatus("再聽一次");
-      await playAudio(audio.word);
-      if (token !== state.token) return;
-    }
+  if (!SpeechCtor()) {
+    setStatus("家長幫手聽一聽");
+    showParentHelp(true);
+    return;
   }
+
+  muteMatching(60000);
+  const heardPromise = listenUntilMatch(token, word);
+
+  if (state.level === 1) {
+    showHint(false);
+    setStatus("聽一聽");
+    await wait(280);
+    if (token !== state.token) return;
+    await playPrompt();
+    if (token !== state.token) return;
+    setStatus("隨時讀：" + word.text, true);
+  } else {
+    showHint(true);
+    setStatus("隨時讀出來", true);
+    muteMatching(200);
+  }
+
+  const parentTimer = setTimeout(() => {
+    if (token !== state.token) return;
+    showParentHelp(true);
+  }, 14000);
+
+  const heard = await heardPromise;
+  clearTimeout(parentTimer);
+  if (token !== state.token) return;
+
+  if (heard.reason === "cancelled") return;
+  if (needsParent(heard)) {
+    setStatus("家長幫手聽一聽");
+    showParentHelp(true);
+    return;
+  }
+
+  await celebrate(token);
 }
 
 async function celebrate(token) {
@@ -707,7 +499,7 @@ async function celebrate(token) {
 function nextWord() {
   state.index += 1;
   if (state.index >= state.theme.words.length) {
-    releaseMic();
+    stopListening();
     els.doneTitle.textContent = state.theme.title + " 完成了！";
     showScreen("done");
     playAudio(audio.bravo);
@@ -729,19 +521,19 @@ $("btn-level-2").addEventListener("click", () => chooseLevel(2));
 
 $("btn-back-home").addEventListener("click", () => {
   state.token += 1;
-  releaseMic();
+  stopListening();
   showScreen("home");
 });
 
 $("btn-back-levels").addEventListener("click", () => {
   state.token += 1;
-  releaseMic();
+  stopListening();
   showScreen("levels");
 });
 
 $("btn-back-themes").addEventListener("click", () => {
   state.token += 1;
-  releaseMic();
+  stopListening();
   hideOverlay();
   showHint(false);
   showScreen("themes");
@@ -759,24 +551,21 @@ $("btn-parent-yes").addEventListener("click", () => {
 $("btn-parent-no").addEventListener("click", async () => {
   const token = state.token;
   showParentHelp(false);
-  state.tries += 1;
-  showOverlay("bad", "再試一次", "images/ui/retry.jpg");
-  playAudio(audio.wrongSfx);
-  await wait(120);
-  await playAudio(audio.tryagain);
-  if (token !== state.token) return;
-  await wait(400);
-  hideOverlay();
-  if (token !== state.token) return;
-  if (state.level === 1 && state.tries % 3 === 0) {
-    setStatus("再聽一次");
-    await playAudio(audio.word);
-    if (token !== state.token) return;
+  if (!state.listening) {
+    playRound(token);
+    return;
   }
-  await playAudio(audio.beep);
-  if (token !== state.token) return;
-  setStatus("家長幫手聽一聽");
-  showParentHelp(true);
+  if (state.level === 1) {
+    setStatus("聽一聽");
+    await playPrompt();
+    if (token !== state.token) return;
+    setStatus("隨時讀：" + currentWord().text, true);
+  } else {
+    setStatus("隨時讀出來", true);
+  }
+  setTimeout(() => {
+    if (token === state.token) showParentHelp(true);
+  }, 14000);
 });
 
 $("btn-skip").addEventListener("click", () => {
@@ -786,30 +575,29 @@ $("btn-skip").addEventListener("click", () => {
 
 $("btn-hint").addEventListener("click", async () => {
   if (state.level !== 2) return;
-  state.awaitingHint = true;
-  if (state.listening) {
-    stopListening();
-    return;
-  }
-  if (els.parentHelp.classList.contains("show")) {
-    const token = state.token;
-    setStatus("聽提示");
-    await playAudio(audio.word);
-    if (token !== state.token) return;
-  }
+  const token = state.token;
+  setStatus("聽提示");
+  await playPrompt();
+  if (token !== state.token) return;
+  setStatus("隨時讀出來", true);
 });
 
-$("btn-hear-again").addEventListener("click", () => {
-  const token = ++state.token;
-  stopListening();
+$("btn-hear-again").addEventListener("click", async () => {
+  const token = state.token;
   hideOverlay();
   showParentHelp(false);
-  playRound(token);
+  setStatus("聽一聽");
+  await playPrompt();
+  if (token !== state.token) return;
+  setStatus("隨時讀：" + currentWord().text, true);
 });
 
 $("btn-done-again").addEventListener("click", () => startTheme(state.theme));
 $("btn-done-home").addEventListener("click", () => showScreen("themes"));
 
 document.addEventListener("visibilitychange", () => {
-  if (document.hidden) releaseMic();
+  if (document.hidden) {
+    state.token += 1;
+    stopListening();
+  }
 });
