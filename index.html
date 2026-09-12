@@ -1,0 +1,109 @@
+<!DOCTYPE html>
+<html lang="zh-Hant-HK">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="default">
+  <meta name="theme-color" content="#fff4e8">
+  <title>小小認字</title>
+  <link rel="manifest" href="manifest.json">
+  <link rel="apple-touch-icon" href="images/ui/mascot.jpg">
+  <link rel="icon" href="images/ui/mascot.jpg">
+  <link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+  <div id="screen-home" class="screen active">
+    <div class="home-bg"></div>
+    <div class="home-content">
+      <img class="mascot" src="images/ui/mascot.jpg" alt="小小認字">
+      <h1 class="title">小小認字</h1>
+      <p class="subtitle">睇圖 · 認字 · 讀出來</p>
+      <button id="btn-start" class="btn btn-primary">開始</button>
+      <p class="home-hint">Level 1 跟住讀，Level 2 自己認字。第一次請允許使用麥克風。</p>
+    </div>
+  </div>
+
+  <div id="screen-levels" class="screen">
+    <div class="theme-content">
+      <div class="topbar">
+        <button id="btn-back-home" class="icon-btn" aria-label="返回">←</button>
+        <h2 class="screen-title">選關卡</h2>
+      </div>
+      <div class="level-list">
+        <button id="btn-level-1" class="level-card" type="button">
+          <span class="level-badge">Level 1</span>
+          <strong>跟住讀</strong>
+          <p>遊戲先讀一次，嘟一聲，你跟住讀。</p>
+        </button>
+        <button id="btn-level-2" class="level-card" type="button">
+          <span class="level-badge level-badge-2">Level 2</span>
+          <strong>自己讀</strong>
+          <p>只出圖案同字。你認得就讀出來。唔識就撳提示。</p>
+        </button>
+      </div>
+    </div>
+  </div>
+
+  <div id="screen-themes" class="screen">
+    <div class="theme-content">
+      <div class="topbar">
+        <button id="btn-back-levels" class="icon-btn" aria-label="返回">←</button>
+        <h2 class="screen-title">選一個主題</h2>
+      </div>
+      <div id="theme-grid" class="theme-grid"></div>
+    </div>
+  </div>
+
+  <div id="screen-play" class="screen">
+    <div class="play-content">
+      <div class="topbar">
+        <button id="btn-back-themes" class="icon-btn" aria-label="返回">←</button>
+        <h2 id="play-title" class="screen-title">主題</h2>
+        <button id="btn-hear-again" class="icon-btn" aria-label="再聽一次">🔊</button>
+      </div>
+      <div id="progress" class="progress"></div>
+      <div class="card">
+        <div class="picture-wrap">
+          <img id="picture" alt="">
+        </div>
+        <div id="word" class="word"></div>
+        <div class="status">
+          <span id="mic-dot" class="mic-dot"></span>
+          <span id="status">聽一聽</span>
+        </div>
+      </div>
+      <button id="btn-hint" class="btn-hint" type="button">提示</button>
+      <div id="parent-help" class="parent-help">
+        <button id="btn-parent-yes" class="yes-btn">讀得啱</button>
+        <button id="btn-parent-no" class="no-btn">再試</button>
+      </div>
+      <div class="parent-bar">
+        <button id="btn-skip">跳過</button>
+        <button id="btn-replay">呢張再來</button>
+      </div>
+    </div>
+    <div id="overlay" class="overlay">
+      <img id="overlay-img" alt="">
+      <div id="overlay-text" class="overlay-text"></div>
+    </div>
+  </div>
+
+  <div id="screen-done" class="screen">
+    <div class="home-bg"></div>
+    <div class="done-content">
+      <img class="mascot" src="images/ui/correct.jpg" alt="完成">
+      <div class="stars">⭐ ⭐ ⭐</div>
+      <h2 id="done-title" class="screen-title" style="text-align:center">完成了！</h2>
+      <p class="subtitle">好叻呀</p>
+      <div class="done-actions">
+        <button id="btn-done-again" class="btn btn-primary">再玩一次</button>
+        <button id="btn-done-home" class="btn btn-secondary">其他主題</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="toast" class="toast"></div>
+  <script type="module" src="js/app.js"></script>
+</body>
+</html>

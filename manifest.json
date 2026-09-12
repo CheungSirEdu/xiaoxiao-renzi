@@ -1,0 +1,16 @@
+{
+  "name": "小小認字",
+  "short_name": "小小認字",
+  "start_url": "./",
+  "display": "standalone",
+  "background_color": "#fff4e8",
+  "theme_color": "#fff4e8",
+  "lang": "zh-Hant-HK",
+  "icons": [
+    {
+      "src": "images/ui/mascot.jpg",
+      "sizes": "512x512",
+      "type": "image/jpeg"
+    }
+  ]
+}
