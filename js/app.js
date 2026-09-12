@@ -433,7 +433,7 @@ async function playRound(token) {
   while (token === state.token) {
     setStatus(state.level === 1 ? "請讀：" + word.text : "請讀出來", true);
     const heardPromise = hearChild(token);
-    await wait(500);
+    await wait(1000);
     if (token !== state.token) return;
     playAudio(audio.beep);
     const heard = await heardPromise;
