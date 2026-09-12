@@ -26,6 +26,7 @@ const els = {
   doneTitle: $("done-title"),
   hint: $("btn-hint"),
   hearAgain: $("btn-hear-again"),
+  voiceMeter: $("voice-meter"),
 };
 
 const audio = {
@@ -41,6 +42,7 @@ const audio = {
 for (const a of Object.values(audio)) {
   a.preload = "auto";
 }
+audio.beep.volume = 0.45;
 
 let state = {
   level: 1,
@@ -52,6 +54,14 @@ let state = {
   recognizer: null,
   parentMode: false,
   awaitingHint: false,
+};
+
+const mic = {
+  stream: null,
+  ctx: null,
+  analyser: null,
+  peak: 0,
+  raf: 0,
 };
 
 function showScreen(name) {
@@ -101,7 +111,13 @@ function currentWord() {
 function normalize(s) {
   return String(s || "")
     .toLowerCase()
-    .replace(/[\s，。！？、.,!?;:：；'"「」『』（）()~～]/g, "")
+    .replace(/[āáǎà]/g, "a")
+    .replace(/[ēéěè]/g, "e")
+    .replace(/[īíǐì]/g, "i")
+    .replace(/[ōóǒò]/g, "o")
+    .replace(/[ūúǔù]/g, "u")
+    .replace(/[\s，。！？、.,!?;:：；'"「」『』（）()~～\-]/g, "")
+    .replace(/[0-9]/g, "")
     .replace(/[啊呀哦嗯啦喎囉咯嘅咗哩呢嗎吗吧]/g, "");
 }
 
@@ -123,16 +139,15 @@ function levenshtein(a, b) {
 function isMatch(heard, word) {
   const h = normalize(heard);
   if (!h) return false;
-  const targets = [word.text, ...(word.aliases || [])].map(normalize);
+  const targets = [word.text, ...(word.aliases || [])].map(normalize).filter(Boolean);
   for (const t of targets) {
-    if (!t) continue;
     if (h === t) return true;
     if (h.includes(t)) return true;
-    if (t.length >= 2 && h.length >= t.length - 1) {
-      const d = levenshtein(h, t);
-      if (d <= 1 && h.length >= t.length - 1) return true;
-    }
+    if (t.length === 1 && h.includes(t)) return true;
+    if (t.length >= 2 && h.length >= 2 && t.includes(h)) return true;
     if (t.length >= 2) {
+      const d = levenshtein(h, t);
+      if (d <= 1) return true;
       const hits = [...t].filter((ch) => h.includes(ch)).length;
       if (hits === t.length && Math.abs(h.length - t.length) <= 2) return true;
     }
@@ -140,13 +155,107 @@ function isMatch(heard, word) {
   return false;
 }
 
+function anyMatch(heard, word) {
+  const texts = [heard.text, ...(heard.alts || [])].filter(Boolean);
+  return texts.some((t) => isMatch(t, word));
+}
+
 function SpeechCtor() {
   return window.SpeechRecognition || window.webkitSpeechRecognition || null;
+}
+
+function setMeter(on, rms = 0) {
+  if (!els.voiceMeter) return;
+  els.voiceMeter.classList.toggle("on", on);
+  if (!on) {
+    els.voiceMeter.dataset.level = "0";
+    return;
+  }
+  const level = rms < 0.012 ? 1 : rms < 0.03 ? 2 : rms < 0.06 ? 3 : rms < 0.11 ? 4 : 5;
+  els.voiceMeter.dataset.level = String(level);
+}
+
+function tickMeter() {
+  if (!mic.analyser) return;
+  const data = new Uint8Array(mic.analyser.fftSize);
+  const loop = () => {
+    mic.raf = requestAnimationFrame(loop);
+    if (!mic.analyser) return;
+    mic.analyser.getByteTimeDomainData(data);
+    let sum = 0;
+    for (let i = 0; i < data.length; i++) {
+      const v = (data[i] - 128) / 128;
+      sum += v * v;
+    }
+    const rms = Math.sqrt(sum / data.length);
+    mic.peak = Math.max(mic.peak * 0.9, rms);
+    if (state.listening) setMeter(true, rms);
+  };
+  loop();
+}
+
+async function ensureMic() {
+  if (mic.stream && mic.stream.active) {
+    try { await mic.ctx.resume(); } catch { /* ignore */ }
+    return true;
+  }
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) return false;
+  try {
+    try {
+      mic.stream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          echoCancellation: true,
+          noiseSuppression: false,
+          autoGainControl: true,
+          channelCount: 1,
+        },
+      });
+    } catch {
+      mic.stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    }
+  } catch {
+    return false;
+  }
+  try {
+    const Ctx = window.AudioContext || window.webkitAudioContext;
+    mic.ctx = new Ctx();
+    await mic.ctx.resume();
+    const src = mic.ctx.createMediaStreamSource(mic.stream);
+    const gain = mic.ctx.createGain();
+    gain.gain.value = 5;
+    mic.analyser = mic.ctx.createAnalyser();
+    mic.analyser.fftSize = 1024;
+    mic.analyser.smoothingTimeConstant = 0.25;
+    src.connect(gain);
+    gain.connect(mic.analyser);
+    tickMeter();
+  } catch {
+    /* analyser is optional; SpeechRecognition can still run */
+  }
+  return true;
+}
+
+function releaseMic() {
+  stopListening();
+  if (mic.raf) cancelAnimationFrame(mic.raf);
+  mic.raf = 0;
+  if (mic.stream) {
+    mic.stream.getTracks().forEach((t) => t.stop());
+    mic.stream = null;
+  }
+  if (mic.ctx) {
+    try { mic.ctx.close(); } catch { /* ignore */ }
+    mic.ctx = null;
+  }
+  mic.analyser = null;
+  mic.peak = 0;
+  setMeter(false);
 }
 
 function stopListening() {
   state.listening = false;
   els.micDot.classList.remove("on");
+  setMeter(false);
   try {
     if (state.recognizer) state.recognizer.stop();
   } catch {
@@ -154,56 +263,127 @@ function stopListening() {
   }
 }
 
-function listenOnce(token) {
+function collectTranscripts(ev) {
+  const texts = [];
+  for (let i = 0; i < ev.results.length; i++) {
+    for (let j = 0; j < ev.results[i].length; j++) {
+      const t = (ev.results[i][j].transcript || "").trim();
+      if (t) texts.push(t);
+    }
+  }
+  return texts;
+}
+
+function listenForWord(token, word, opts) {
+  const duration = opts.duration || 9000;
+  const ignoreUntil = opts.ignoreUntil || 0;
   return new Promise((resolve) => {
     const Ctor = SpeechCtor();
     if (!Ctor) {
-      resolve({ text: "", reason: "unsupported" });
+      resolve({ text: "", reason: "unsupported", alts: [] });
       return;
     }
 
-    const rec = new Ctor();
-    state.recognizer = rec;
-    rec.lang = "zh-HK";
-    rec.interimResults = false;
-    rec.maxAlternatives = 5;
-    rec.continuous = false;
-
+    const deadline = Date.now() + duration;
+    const alts = [];
+    let rec = null;
     let settled = false;
+    let armed = Date.now() >= ignoreUntil;
+    let restarting = false;
+
     const finish = (value) => {
       if (settled || token !== state.token) return;
       settled = true;
       state.listening = false;
       els.micDot.classList.remove("on");
-      try { rec.stop(); } catch { /* ignore */ }
+      try { if (rec) rec.stop(); } catch { /* ignore */ }
       resolve(value);
     };
 
-    rec.onresult = (ev) => {
-      const texts = [];
-      for (let i = 0; i < ev.results.length; i++) {
-        for (let j = 0; j < ev.results[i].length; j++) {
-          texts.push(ev.results[i][j].transcript);
-        }
+    const pack = (reason) => {
+      const heardSound = armed && mic.peak > 0.018;
+      return {
+        text: alts[0] || "",
+        alts: alts.slice(),
+        reason: alts.length ? "ok" : reason,
+        heardSound,
+      };
+    };
+
+    const startRec = () => {
+      if (settled || token !== state.token || restarting) return;
+      if (Date.now() >= deadline) {
+        finish(pack("timeout"));
+        return;
       }
-      finish({ text: texts.join(" "), alts: texts, reason: "ok" });
-    };
-    rec.onerror = (ev) => {
-      finish({ text: "", reason: ev.error || "error" });
-    };
-    rec.onend = () => {
-      finish({ text: "", reason: "end" });
+      rec = new Ctor();
+      state.recognizer = rec;
+      rec.lang = "zh-HK";
+      rec.interimResults = true;
+      rec.maxAlternatives = 8;
+      rec.continuous = true;
+
+      rec.onresult = (ev) => {
+        if (settled || token !== state.token) return;
+        if (Date.now() < ignoreUntil) return;
+        armed = true;
+        const texts = collectTranscripts(ev);
+        for (const t of texts) {
+          if (!alts.includes(t)) alts.push(t);
+          if (isMatch(t, word)) {
+            finish({ text: t, alts: alts.slice(), reason: "ok", heardSound: true });
+            return;
+          }
+        }
+      };
+      rec.onerror = (ev) => {
+        const err = ev.error || "error";
+        if (err === "no-speech" || err === "aborted" || err === "audio-capture") return;
+        if (err === "not-allowed" || err === "service-not-allowed") {
+          finish({ text: "", reason: err, alts: [] });
+        }
+      };
+      rec.onend = () => {
+        if (settled || token !== state.token) return;
+        if (Date.now() < deadline) {
+          restarting = true;
+          setTimeout(() => {
+            restarting = false;
+            startRec();
+          }, 60);
+          return;
+        }
+        finish(pack("end"));
+      };
+
+      try {
+        rec.start();
+      } catch {
+        restarting = true;
+        setTimeout(() => {
+          restarting = false;
+          startRec();
+        }, 180);
+      }
     };
 
-    try {
-      state.listening = true;
-      els.micDot.classList.add("on");
-      rec.start();
-    } catch (err) {
-      finish({ text: "", reason: String(err) });
+    state.listening = true;
+    els.micDot.classList.add("on");
+    setMeter(true, 0);
+    if (ignoreUntil > Date.now()) {
+      setTimeout(() => {
+        if (!settled) {
+          mic.peak = 0;
+          armed = true;
+        }
+      }, Math.max(0, ignoreUntil - Date.now()));
     }
-
-    setTimeout(() => finish({ text: "", reason: "timeout" }), 5000);
+    startRec();
+    setTimeout(() => {
+      if (settled) return;
+      try { if (rec) rec.stop(); } catch { /* ignore */ }
+      finish(pack("timeout"));
+    }, duration + 500);
   });
 }
 
@@ -211,11 +391,15 @@ async function listenServer(token) {
   if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
     return { text: "", reason: "no-media" };
   }
-  let stream;
-  try {
-    stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-  } catch {
-    return { text: "", reason: "mic-denied" };
+  let stream = mic.stream && mic.stream.active ? mic.stream : null;
+  let owned = false;
+  if (!stream) {
+    try {
+      stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      owned = true;
+    } catch {
+      return { text: "", reason: "mic-denied" };
+    }
   }
 
   const mime = MediaRecorder.isTypeSupported("audio/webm;codecs=opus")
@@ -235,14 +419,14 @@ async function listenServer(token) {
   await wait(2800);
   if (token !== state.token) {
     rec.stop();
-    stream.getTracks().forEach((t) => t.stop());
+    if (owned) stream.getTracks().forEach((t) => t.stop());
     return { text: "", reason: "cancelled" };
   }
   await new Promise((resolve) => {
     rec.onstop = resolve;
     try { rec.stop(); } catch { resolve(); }
   });
-  stream.getTracks().forEach((t) => t.stop());
+  if (owned) stream.getTracks().forEach((t) => t.stop());
   state.listening = false;
   els.micDot.classList.remove("on");
 
@@ -263,18 +447,28 @@ function needsParent(heard) {
   );
 }
 
-async function hearChild(token) {
+async function hearChild(token, word) {
   const web = SpeechCtor();
   if (web) {
-    const first = await listenOnce(token);
+    const first = await listenForWord(token, word, {
+      duration: 10000,
+      ignoreUntil: Date.now() + 1400,
+    });
     if (token !== state.token) return { text: "", reason: "cancelled" };
     if (first.text) return first;
-    const fallback = ["not-allowed", "service-not-allowed", "network", "aborted"];
+    const fallback = ["not-allowed", "service-not-allowed", "network"];
     if (fallback.includes(first.reason)) {
       const second = await listenServer(token);
       if (token !== state.token) return { text: "", reason: "cancelled" };
       if (second.text) return second;
       return { text: "", reason: "unsupported" };
+    }
+    if (!first.text && first.heardSound && mic.stream) {
+      mic.stream.getAudioTracks().forEach((t) => { t.enabled = false; });
+      const solo = await listenForWord(token, word, { duration: 6000, ignoreUntil: 0 });
+      mic.stream.getAudioTracks().forEach((t) => { t.enabled = true; });
+      if (token !== state.token) return { text: "", reason: "cancelled" };
+      if (solo.text) return solo;
     }
     return first;
   }
@@ -288,6 +482,8 @@ async function hearChild(token) {
 function setStatus(text, listening = false) {
   els.status.textContent = text;
   els.micDot.classList.toggle("on", listening);
+  if (listening) setMeter(true, mic.peak);
+  else setMeter(false);
 }
 
 function renderProgress() {
@@ -349,14 +545,8 @@ async function unlockAudioAndMic() {
       a.muted = false;
     }
   }
-  if (navigator.mediaDevices && navigator.mediaDevices.getUserMedia) {
-    try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      stream.getTracks().forEach((t) => t.stop());
-    } catch {
-      toast("請允許使用麥克風，小朋友先可以讀俾遊戲聽。");
-    }
-  }
+  const ok = await ensureMic();
+  if (!ok) toast("請允許使用麥克風，小朋友先可以讀俾遊戲聽。");
 }
 
 function renderThemes() {
@@ -430,9 +620,13 @@ async function playRound(token) {
     }
   }
 
+  await ensureMic();
+  if (token !== state.token) return;
+
   while (token === state.token) {
+    mic.peak = 0;
     setStatus(state.level === 1 ? "請讀：" + word.text : "請讀出來", true);
-    const heardPromise = hearChild(token);
+    const heardPromise = hearChild(token, word);
     await wait(1000);
     if (token !== state.token) return;
     playAudio(audio.beep);
@@ -454,13 +648,33 @@ async function playRound(token) {
       return;
     }
 
-    if (isMatch(heard.text, word)) {
+    if (anyMatch(heard, word)) {
       await celebrate(token);
       return;
     }
 
+    if (!heard.text) {
+      state.tries += 1;
+      stopListening();
+      if (state.tries >= 3) {
+        setStatus("家長幫手聽一聽");
+        showParentHelp(true);
+        return;
+      }
+      setStatus(heard.heardSound ? "大聲啲讀俾我聽" : "聽唔到，再讀一次", true);
+      await wait(700);
+      if (token !== state.token) return;
+      continue;
+    }
+
     state.tries += 1;
     stopListening();
+    if (state.tries === 1) {
+      setStatus("再讀一次，大聲啲", true);
+      await wait(650);
+      if (token !== state.token) return;
+      continue;
+    }
     showOverlay("bad", "再試一次", "images/ui/retry.jpg");
     playAudio(audio.wrongSfx);
     await wait(120);
@@ -493,6 +707,7 @@ async function celebrate(token) {
 function nextWord() {
   state.index += 1;
   if (state.index >= state.theme.words.length) {
+    releaseMic();
     els.doneTitle.textContent = state.theme.title + " 完成了！";
     showScreen("done");
     playAudio(audio.bravo);
@@ -514,19 +729,19 @@ $("btn-level-2").addEventListener("click", () => chooseLevel(2));
 
 $("btn-back-home").addEventListener("click", () => {
   state.token += 1;
-  stopListening();
+  releaseMic();
   showScreen("home");
 });
 
 $("btn-back-levels").addEventListener("click", () => {
   state.token += 1;
-  stopListening();
+  releaseMic();
   showScreen("levels");
 });
 
 $("btn-back-themes").addEventListener("click", () => {
   state.token += 1;
-  stopListening();
+  releaseMic();
   hideOverlay();
   showHint(false);
   showScreen("themes");
@@ -596,5 +811,5 @@ $("btn-done-again").addEventListener("click", () => startTheme(state.theme));
 $("btn-done-home").addEventListener("click", () => showScreen("themes"));
 
 document.addEventListener("visibilitychange", () => {
-  if (document.hidden) stopListening();
+  if (document.hidden) releaseMic();
 });
