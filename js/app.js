@@ -52,6 +52,8 @@ let state = {
   listening: false,
   recognizer: null,
   ignoreUntil: 0,
+  holdListen: false,
+  kickListen: null,
   micReady: false,
 };
 
@@ -185,10 +187,12 @@ async function ensureMic() {
 
 function stopListening() {
   state.listening = false;
+  state.holdListen = false;
+  state.kickListen = null;
   els.micDot.classList.remove("on");
   setMeter(false);
   try {
-    if (state.recognizer) state.recognizer.stop();
+    if (state.recognizer) state.recognizer.abort();
   } catch {
     /* ignore */
   }
@@ -233,23 +237,26 @@ function listenUntilMatch(token, word) {
     let settled = false;
     let restarting = false;
     let langIndex = 0;
+    let gen = 0;
 
     const finish = (value) => {
       if (settled) return;
       settled = true;
       state.listening = false;
+      state.kickListen = null;
       els.micDot.classList.remove("on");
       setMeter(false);
-      try { if (rec) rec.stop(); } catch { /* ignore */ }
+      try { if (rec) rec.abort(); } catch { /* ignore */ }
       resolve(value);
     };
 
     const startRec = () => {
-      if (settled || restarting) return;
+      if (settled || restarting || state.holdListen) return;
       if (token !== state.token) {
         finish({ text: "", reason: "cancelled" });
         return;
       }
+      const myGen = ++gen;
       rec = new Ctor();
       state.recognizer = rec;
       rec.lang = LANGS[langIndex % LANGS.length];
@@ -260,8 +267,8 @@ function listenUntilMatch(token, word) {
       bindGrammar(rec, word);
 
       rec.onresult = (ev) => {
-        if (settled || token !== state.token) return;
-        if (Date.now() < state.ignoreUntil) return;
+        if (settled || token !== state.token || myGen !== gen) return;
+        if (state.holdListen || Date.now() < state.ignoreUntil) return;
         const texts = collectTranscripts(ev);
         for (const t of texts) {
           if (isMatch(t, word)) {
@@ -271,6 +278,7 @@ function listenUntilMatch(token, word) {
         }
       };
       rec.onerror = (ev) => {
+        if (myGen !== gen) return;
         const err = ev.error || "error";
         if (err === "no-speech" || err === "aborted" || err === "audio-capture" || err === "network") return;
         if (err === "not-allowed" || err === "service-not-allowed") {
@@ -278,11 +286,12 @@ function listenUntilMatch(token, word) {
         }
       };
       rec.onend = () => {
-        if (settled) return;
+        if (settled || myGen !== gen) return;
         if (token !== state.token) {
           finish({ text: "", reason: "cancelled" });
           return;
         }
+        if (state.holdListen) return;
         restarting = true;
         setTimeout(() => {
           restarting = false;
@@ -301,11 +310,27 @@ function listenUntilMatch(token, word) {
       }
     };
 
+    state.kickListen = startRec;
     state.listening = true;
     els.micDot.classList.add("on");
     setMeter(true);
     startRec();
   });
+}
+
+function pauseRecognizer() {
+  state.holdListen = true;
+  try {
+    if (state.recognizer) state.recognizer.abort();
+  } catch {
+    /* ignore */
+  }
+}
+
+function resumeRecognizer() {
+  state.holdListen = false;
+  state.ignoreUntil = Date.now() + 400;
+  if (typeof state.kickListen === "function") state.kickListen();
 }
 
 function needsParent(heard) {
@@ -353,14 +378,11 @@ function setLevelChrome() {
   showHint(state.level === 2);
 }
 
-function muteMatching(ms) {
-  state.ignoreUntil = Date.now() + ms;
-}
-
 async function playPrompt() {
-  muteMatching(8000);
+  pauseRecognizer();
   await playAudio(audio.word);
-  muteMatching(250);
+  await wait(1100);
+  resumeRecognizer();
 }
 
 async function unlockAudioAndMic() {
@@ -447,22 +469,21 @@ async function playRound(token) {
     return;
   }
 
-  muteMatching(60000);
-  const heardPromise = listenUntilMatch(token, word);
-
   if (state.level === 1) {
     showHint(false);
     setStatus("聽一聽");
     await wait(280);
     if (token !== state.token) return;
-    await playPrompt();
+    await playAudio(audio.word);
+    await wait(1100);
     if (token !== state.token) return;
     setStatus("隨時讀：" + word.text, true);
   } else {
     showHint(true);
     setStatus("隨時讀出來", true);
-    muteMatching(200);
   }
+
+  const heardPromise = listenUntilMatch(token, word);
 
   const parentTimer = setTimeout(() => {
     if (token !== state.token) return;
